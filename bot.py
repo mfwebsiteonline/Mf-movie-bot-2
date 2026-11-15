@@ -1,20 +1,15 @@
 import os
 import re
 import math
-import asyncio
-from aiohttp import web
-from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client, filters, enums, idle
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
-from pyrogram.errors import UserNotParticipant, FloodWait
+import threading
+from flask import Flask
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pymongo import MongoClient
 
 # ================= CONFIGURATION =================
 BOT_NAME = "MF MOVIE BOT 2"
-API_ID = int(os.environ.get("API_ID", 39140696))
-API_HASH = os.environ.get("API_HASH", "64757b9724e7143c5cc554d7a776334b")
-
-# Render Environment Variable-ൽ നിന്ന് BOT_TOKEN എടുക്കുന്നു
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
 ADMINS = [7199304293]
 LOG_CHANNEL = -1004461624670
@@ -34,26 +29,28 @@ PORT = int(os.environ.get("PORT", 8080))
 # =================================================
 
 if not BOT_TOKEN:
-    print("❌ ERROR: BOT_TOKEN കാണുന്നില്ല! Render Environment Variables-ൽ BOT_TOKEN ചേർക്കുക.")
+    print("❌ ERROR: BOT_TOKEN കാണുന്നില്ല! Render Environment-ൽ BOT_TOKEN നൽകുക.")
     exit(1)
 
-app = Client(
-    "MF_MOVIE_BOT_2",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True
-)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # MongoDB Connection
-db_client = AsyncIOMotorClient(DATABASE_URI)
-db = db_client[DATABASE_NAME]
+mongo_client = MongoClient(DATABASE_URI)
+db = mongo_client[DATABASE_NAME]
 files_col = db["files"]
 users_col = db["users"]
 
-INVITE_LINK = None
-INDEX_CANCEL = False
+# Flask Web Server for Render
+web_app = Flask(__name__)
 
+@web_app.route("/")
+def home():
+    return f"{BOT_NAME} is Running Alive!"
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=PORT)
+
+# ----------------- HELPER FUNCTIONS -----------------
 def get_size(size):
     units = ["Bytes", "KB", "MB", "GB", "TB"]
     size = float(size)
@@ -63,133 +60,45 @@ def get_size(size):
         size /= 1024.0
     return f"{size:.2f} {units[i]}"
 
-async def add_user(user_id, name):
+def add_user(user_id, name):
     try:
-        if not await users_col.find_one({"_id": user_id}):
-            await users_col.insert_one({"_id": user_id, "name": name})
-            await app.send_message(
+        if not users_col.find_one({"_id": user_id}):
+            users_col.insert_one({"_id": user_id, "name": name})
+            bot.send_message(
                 LOG_CHANNEL,
-                f"🆕 **#NewUser in {BOT_NAME}**\n👤 **Name:** {name}\n🆔 **ID:** `{user_id}`"
+                f"🆕 <b>#NewUser in {BOT_NAME}</b>\n👤 <b>Name:</b> {name}\n🆔 <b>ID:</b> <code>{user_id}</code>"
             )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Log error: {e}")
 
-async def is_subscribed(client: Client, user_id: int):
+def is_subscribed(user_id):
     if not AUTH_CHANNEL or user_id in ADMINS:
         return True
     try:
-        member = await client.get_chat_member(AUTH_CHANNEL, user_id)
-        if member.status in [enums.ChatMemberStatus.BANNED, enums.ChatMemberStatus.LEFT]:
+        member = bot.get_chat_member(AUTH_CHANNEL, user_id)
+        if member.status in ["left", "kicked"]:
             return False
         return True
-    except UserNotParticipant:
-        return False
     except Exception:
         return True
 
-async def get_invite_link(client: Client):
-    global INVITE_LINK
-    if INVITE_LINK:
-        return INVITE_LINK
+def get_invite_link():
     try:
-        chat = await client.get_chat(AUTH_CHANNEL)
+        chat = bot.get_chat(AUTH_CHANNEL)
         if chat.username:
-            INVITE_LINK = f"https://t.me/{chat.username}"
-        else:
-            link = await client.create_chat_invite_link(AUTH_CHANNEL)
-            INVITE_LINK = link.invite_link
-        return INVITE_LINK
+            return f"https://t.me/{chat.username}"
+        if chat.invite_link:
+            return chat.invite_link
+        return bot.export_chat_invite_link(AUTH_CHANNEL)
     except Exception:
         return CHNL_LNK
 
-# ----------------- START & ADMIN COMMANDS -----------------
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    await add_user(user_id, message.from_user.first_name)
-
-    if len(message.command) > 1 and message.command[1].startswith("file_"):
-        file_unique_id = message.command[1].split("_", 1)[1]
-        
-        if not await is_subscribed(client, user_id):
-            invite_url = await get_invite_link(client)
-            btn = [
-                [InlineKeyboardButton("📢 Join Our Main Channel", url=invite_url)],
-                [InlineKeyboardButton("🔄 Try Again", callback_data=f"checksub_{file_unique_id}")]
-            ]
-            return await message.reply_text(
-                f"❗ **നിങ്ങൾ ഞങ്ങളുടെ ചാനലിൽ ജോയിൻ ചെയ്തിട്ടില്ല!**\n\n"
-                f"**{BOT_NAME}**-ൽ നിന്ന് ഫയലുകൾ ലഭിക്കാൻ താഴെ കാണുന്ന ബട്ടൺ വഴി ചാനലിൽ ജോയിൻ ചെയ്ത ശേഷം **Try Again** ക്ലിക്ക് ചെയ്യുക.",
-                reply_markup=InlineKeyboardMarkup(btn)
-            )
-        
-        file_data = await files_col.find_one({"_id": file_unique_id})
-        if not file_data:
-            return await message.reply_text("❌ ഈ ഫയൽ ഡാറ്റാബേസിൽ കണ്ടെത്താനായില്ല!")
-        
-        return await client.send_cached_media(
-            chat_id=user_id,
-            file_id=file_data["file_id"],
-            caption=f"🎬 **{file_data['file_name']}**\n📦 **Size:** `{get_size(file_data['file_size'])}`\n\n🤖 **Powered By:** **{BOT_NAME}**\n📢 **Join:** [Movie Request Group]({GRP_LNK})"
-        )
-
-    btn = [
-        [InlineKeyboardButton("➕ Add Me To Your Group ➕", url=f"https://t.me/{client.me.username}?startgroup=true")],
-        [
-            InlineKeyboardButton("🎬 Request Group", url=GRP_LNK),
-            InlineKeyboardButton("📢 Main Channel", url=CHNL_LNK)
-        ],
-        [InlineKeyboardButton("📊 Bot Status", callback_data="status_cb")]
-    ]
-    await message.reply_photo(
-        photo=START_PIC,
-        caption=f"ഹലോ **{message.from_user.mention}** 👋,\n\n"
-                f"ഞാൻ **{BOT_NAME}** ആണ്! 🎬\n\n"
-                f"നിങ്ങൾക്ക് ആവശ്യമുള്ള സിനിമകളുടെയോ സീരീസുകളുടെയോ പേര് ഇവിടെയോ ഞങ്ങളുടെ ഗ്രൂപ്പിലോ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ ഉടൻ ഫയൽ ലഭിക്കും.",
-        reply_markup=InlineKeyboardMarkup(btn)
-    )
-
-@app.on_message(filters.command("stats") & filters.user(ADMINS))
-async def stats_cmd(client: Client, message: Message):
-    total_files = await files_col.count_documents({})
-    total_users = await users_col.count_documents({})
-    await message.reply_text(
-        f"📊 **{BOT_NAME} - Database Statistics**\n\n"
-        f"📁 **Total Files Saved:** `{total_files}`\n"
-        f"👥 **Total Users:** `{total_users}`"
-    )
-
-@app.on_message(filters.command("deleteall") & filters.user(ADMINS))
-async def delete_all_cmd(client: Client, message: Message):
-    await files_col.delete_many({})
-    await message.reply_text("🗑️ **ഡാറ്റാബേസിലെ എല്ലാ ഫയലുകളും ഡിലീറ്റ് ചെയ്തു!**")
-
-@app.on_message(filters.command("broadcast") & filters.user(ADMINS) & filters.reply)
-async def broadcast_cmd(client: Client, message: Message):
-    users = users_col.find({})
-    b_msg = message.reply_to_message
-    sts = await message.reply_text("⏳ **Broadcasting message...**")
-    success = 0
-    failed = 0
-    async for user in users:
-        try:
-            await b_msg.copy(chat_id=user["_id"])
-            success += 1
-            await asyncio.sleep(0.05)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            await b_msg.copy(chat_id=user["_id"])
-            success += 1
-        except Exception:
-            failed += 1
-    await sts.edit_text(f"✅ **Broadcast Completed!**\n\n🟢 **Success:** `{success}`\n🔴 **Failed:** `{failed}`")
-
-# ----------------- AUTO & BULK FILE INDEXING -----------------
-async def save_file_to_db(message: Message):
+def save_file_to_db(message):
     media = message.document or message.video or message.audio
     if not media:
         return False
-    file_name = media.file_name or message.caption or "Unknown_File"
+    
+    file_name = getattr(media, "file_name", None) or message.caption or "Movie_File"
     clean_name = re.sub(r"[@_\-\.\+]", " ", file_name)
     
     file_doc = {
@@ -198,72 +107,150 @@ async def save_file_to_db(message: Message):
         "file_name": file_name,
         "search_name": clean_name.lower(),
         "file_size": media.file_size,
-        "caption": message.caption or file_name
+        "file_type": message.content_type
     }
     try:
-        await files_col.update_one({"_id": media.file_unique_id}, {"$set": file_doc}, upsert=True)
+        files_col.update_one({"_id": media.file_unique_id}, {"$set": file_doc}, upsert=True)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"DB Error: {e}")
         return False
 
-@app.on_message(filters.chat(FILE_CHANNELS) & (filters.document | filters.video | filters.audio))
-async def auto_save_file(client: Client, message: Message):
-    await save_file_to_db(message)
+def send_file_to_user(chat_id, file_data):
+    caption = (
+        f"🎬 <b>{file_data['file_name']}</b>\n"
+        f"📦 <b>Size:</b> <code>{get_size(file_data['file_size'])}</code>\n\n"
+        f"🤖 <b>Powered By:</b> <b>{BOT_NAME}</b>\n"
+        f"📢 <b>Join:</b> <a href='{GRP_LNK}'>Movie Request Group</a>"
+    )
+    f_type = file_data.get("file_type", "document")
+    try:
+        if f_type == "video":
+            bot.send_video(chat_id, file_data["file_id"], caption=caption)
+        elif f_type == "audio":
+            bot.send_audio(chat_id, file_data["file_id"], caption=caption)
+        else:
+            bot.send_document(chat_id, file_data["file_id"], caption=caption)
+    except Exception:
+        bot.send_document(chat_id, file_data["file_id"], caption=caption)
 
-@app.on_message(filters.private & filters.user(ADMINS) & (filters.forwarded | filters.document | filters.video | filters.audio))
-async def admin_index_handler(client: Client, message: Message):
-    if message.forward_from_chat and message.forward_from_chat.type == enums.ChatType.CHANNEL:
-        chat_id = message.forward_from_chat.id
-        last_msg_id = message.forward_from_message_id
-        btn = [
-            [InlineKeyboardButton("✅ Start Bulk Indexing", callback_data=f"index_{chat_id}_{last_msg_id}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="close_data")]
-        ]
-        return await message.reply_text(
-            f"📢 **Channel ID:** `{chat_id}`\n"
-            f"🔢 **Total Messages to Scan:** `{last_msg_id}`\n\n"
-            f"ഈ ചാനലിലെ പഴയ ഫയലുകൾ എല്ലാം ഡാറ്റാബേസിലേക്ക് സേവ് ചെയ്യണോ?",
-            reply_markup=InlineKeyboardMarkup(btn)
-        )
+# ----------------- START & ADMIN COMMANDS -----------------
+@bot.message_handler(commands=["start"])
+def start_cmd(message):
+    if message.chat.type != "private":
+        return
     
-    if await save_file_to_db(message):
-        await message.reply_text(f"✅ **ഫയൽ {BOT_NAME} ഡാറ്റാബേസിലേക്ക് സേവ് ചെയ്തിട്ടുണ്ട്!**", quote=True)
+    user_id = message.from_user.id
+    add_user(user_id, message.from_user.first_name)
+
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("file_"):
+        file_unique_id = args[1].split("_", 1)[1]
+        
+        if not is_subscribed(user_id):
+            invite_url = get_invite_link()
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("📢 Join Our Main Channel", url=invite_url))
+            markup.add(InlineKeyboardButton("🔄 Try Again", callback_data=f"checksub_{file_unique_id}"))
+            return bot.send_message(
+                user_id,
+                f"❗ <b>നിങ്ങൾ ഞങ്ങളുടെ ചാനലിൽ ജോയിൻ ചെയ്തിട്ടില്ല!</b>\n\n"
+                f"<b>{BOT_NAME}</b>-ൽ നിന്ന് ഫയലുകൾ ലഭിക്കാൻ താഴെ കാണുന്ന ബട്ടൺ വഴി ചാനലിൽ ജോയിൻ ചെയ്ത ശേഷം <b>Try Again</b> ക്ലിക്ക് ചെയ്യുക.",
+                reply_markup=markup
+            )
+        
+        file_data = files_col.find_one({"_id": file_unique_id})
+        if not file_data:
+            return bot.send_message(user_id, "❌ ഈ ഫയൽ ഡാറ്റാബേസിൽ കണ്ടെത്താനായില്ല!")
+        
+        return send_file_to_user(user_id, file_data)
+
+    bot_username = bot.get_me().username
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("➕ Add Me To Your Group ➕", url=f"https://t.me/{bot_username}?startgroup=true"))
+    markup.row(
+        InlineKeyboardButton("🎬 Request Group", url=GRP_LNK),
+        InlineKeyboardButton("📢 Main Channel", url=CHNL_LNK)
+    )
+    markup.add(InlineKeyboardButton("📊 Bot Status", callback_data="status_cb"))
+
+    bot.send_photo(
+        user_id,
+        photo=START_PIC,
+        caption=(
+            f"ഹലോ <b>{message.from_user.first_name}</b> 👋,\n\n"
+            f"ഞാൻ <b>{BOT_NAME}</b> ആണ്! 🎬\n\n"
+            f"നിങ്ങൾക്ക് ആവശ്യമുള്ള സിനിമകളുടെയോ സീരീസുകളുടെയോ പേര് ഇവിടെയോ ഞങ്ങളുടെ ഗ്രൂപ്പിലോ ടൈപ്പ് ചെയ്ത് അയച്ചാൽ ഉടൻ ഫയൽ ലഭിക്കും."
+        ),
+        reply_markup=markup
+    )
+
+@bot.message_handler(commands=["stats"])
+def stats_cmd(message):
+    if message.from_user.id not in ADMINS:
+        return
+    total_files = files_col.count_documents({})
+    total_users = users_col.count_documents({})
+    bot.reply_to(
+        message,
+        f"📊 <b>{BOT_NAME} - Statistics</b>\n\n"
+        f"📁 <b>Total Files:</b> <code>{total_files}</code>\n"
+        f"👥 <b>Total Users:</b> <code>{total_users}</code>"
+    )
+
+@bot.message_handler(commands=["deleteall"])
+def delete_all_cmd(message):
+    if message.from_user.id not in ADMINS:
+        return
+    files_col.delete_many({})
+    bot.reply_to(message, "🗑️ <b>ഡാറ്റാബേസിലെ എല്ലാ ഫയലുകളും ഡിലീറ്റ് ചെയ്തു!</b>")
+
+# ----------------- AUTO CHANNEL & ADMIN FILE SAVING -----------------
+@bot.channel_post_handler(content_types=["document", "video", "audio"])
+def channel_file_save(message):
+    if message.chat.id in FILE_CHANNELS:
+        save_file_to_db(message)
+
+@bot.message_handler(content_types=["document", "video", "audio"])
+def admin_pm_file_save(message):
+    if message.chat.type == "private" and message.from_user.id in ADMINS:
+        if save_file_to_db(message):
+            bot.reply_to(message, f"✅ <b>ഫയൽ {BOT_NAME} ഡാറ്റാബേസിലേക്ക് സേവ് ചെയ്തിട്ടുണ്ട്!</b>")
 
 # ----------------- SEARCH & PAGINATION -----------------
-@app.on_message(filters.text & (filters.group | filters.private) & ~filters.command(["start", "stats", "deleteall", "broadcast"]))
-async def search_files(client: Client, message: Message):
+@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"), content_types=["text"])
+def search_files(message):
     query = message.text.strip()
-    if len(query) < 2 or query.startswith("/"):
+    if len(query) < 2:
         return
 
     clean_query = re.sub(r"[@_\-\.\+]", " ", query).lower()
     words = clean_query.split()
     regex_pattern = ".*".join(map(re.escape, words))
 
-    cursor = files_col.find({"search_name": {"$regex": regex_pattern, "$options": "i"}})
-    results = await cursor.to_list(length=50)
+    results = list(files_col.find({"search_name": {"$regex": regex_pattern, "$options": "i"}}).limit(50))
 
     if not results:
-        if message.chat.type == enums.ChatType.PRIVATE:
-            await message.reply_text("😕 ഈ പേരിൽ ഫയലുകൾ ഒന്നും കണ്ടെത്തിയില്ല. സ്പെല്ലിംഗ് കറക്റ്റ് ആണോ എന്ന് പരിശോധിക്കുക.")
+        if message.chat.type == "private":
+            bot.reply_to(message, "😕 ഈ പേരിൽ ഫയലുകൾ ഒന്നും കണ്ടെത്തിയില്ല. സ്പെല്ലിംഗ് കറക്റ്റ് ആണോ എന്ന് പരിശോധിക്കുക.")
         return
 
-    await send_results_page(client, message, results, query, page=0)
+    send_results_page(message, results, query, page=0)
 
-async def send_results_page(client: Client, message_or_cb, results, query, page=0):
+def send_results_page(message_or_call, results, query, page=0, is_edit=False):
     per_page = 10
     total_pages = math.ceil(len(results) / per_page)
     start_idx = page * per_page
     end_idx = start_idx + per_page
     current_files = results[start_idx:end_idx]
 
-    bot_username = client.me.username
-    buttons = []
+    bot_username = bot.get_me().username
+    markup = InlineKeyboardMarkup()
 
     for file in current_files:
         size_str = get_size(file["file_size"])
         btn_text = f"[{size_str}] {file['file_name']}"
-        buttons.append([InlineKeyboardButton(btn_text, url=f"https://t.me/{bot_username}?start=file_{file['_id']}")])
+        markup.add(InlineKeyboardButton(btn_text, url=f"https://t.me/{bot_username}?start=file_{file['_id']}"))
 
     nav_btns = []
     if page > 0:
@@ -273,99 +260,61 @@ async def send_results_page(client: Client, message_or_cb, results, query, page=
         nav_btns.append(InlineKeyboardButton("Next ➡️", callback_data=f"page_{page+1}_{query[:25]}"))
 
     if len(nav_btns) > 1:
-        buttons.append(nav_btns)
+        markup.row(*nav_btns)
 
     text = (
-        f"🤖 **{BOT_NAME}**\n"
-        f"🔍 **Search:** `{query}`\n"
-        f"📁 **Results:** `{len(results)}`\n\n"
-        f"👇 **താഴെ കാണുന്ന ബട്ടണിൽ ക്ലിക്ക് ചെയ്ത് ഫയൽ ഡൗൺലോഡ് ചെയ്യാം:**"
+        f"🤖 <b>{BOT_NAME}</b>\n"
+        f"🔍 <b>Search:</b> <code>{query}</code>\n"
+        f"📁 <b>Results:</b> <code>{len(results)}</code>\n\n"
+        f"👇 <b>താഴെ കാണുന്ന ബട്ടണിൽ ക്ലിക്ക് ചെയ്ത് ഫയൽ ഡൗൺലോഡ് ചെയ്യാം:</b>"
     )
 
-    if isinstance(message_or_cb, Message):
-        await message_or_cb.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), quote=True)
-    elif isinstance(message_or_cb, CallbackQuery):
-        await message_or_cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    if is_edit:
+        bot.edit_message_text(
+            text,
+            chat_id=message_or_call.message.chat.id,
+            message_id=message_or_call.message.message_id,
+            reply_markup=markup
+        )
+    else:
+        bot.reply_to(message_or_call, text, reply_markup=markup)
 
 # ----------------- CALLBACK HANDLERS -----------------
-@app.on_callback_query()
-async def cb_handler(client: Client, query: CallbackQuery):
-    global INDEX_CANCEL
-    data = query.data
-    user_id = query.from_user.id
+@bot.callback_query_handler(func=lambda call: True)
+def cb_handler(call):
+    data = call.data
+    user_id = call.from_user.id
 
     if data == "noop":
-        await query.answer()
-
-    elif data == "close_data":
-        await query.message.delete()
-
-    elif data == "cancel_index":
-        INDEX_CANCEL = True
-        await query.answer("🛑 Indexing സ്റ്റോപ്പ് ചെയ്യുന്നു...", show_alert=True)
-
-    elif data.startswith("index_"):
-        _, chat_id_str, last_id_str = data.split("_")
-        chat_id = int(chat_id_str)
-        last_msg_id = int(last_id_str)
-        INDEX_CANCEL = False
-
-        await query.message.edit_text(
-            "⏳ **Indexing Started... ദയവായി കാത്തിരിക്കുക.**",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel Indexing", callback_data="cancel_index")]])
-        )
-
-        saved = 0
-        current = 1
-        while current <= last_msg_id:
-            if INDEX_CANCEL:
-                return await query.message.edit_text(f"🛑 **Indexing Cancelled!**\n✅ **Total Saved:** `{saved}`")
-            
-            batch_ids = list(range(current, min(current + 100, last_msg_id + 1)))
-            try:
-                messages = await client.get_messages(chat_id, batch_ids)
-                for msg in messages:
-                    if msg and (msg.document or msg.video or msg.audio):
-                        if await save_file_to_db(msg):
-                            saved += 1
-            except FloodWait as e:
-                await asyncio.sleep(e.value)
-                continue
-            except Exception as e:
-                return await query.message.edit_text(f"❌ **Error:** ചാനലിൽ ബോട്ട് Admin ആണെന്ന് ഉറപ്പുവരുത്തുക!\n`{e}`")
-
-            current += 100
-            if current % 200 == 1:
-                try:
-                    await query.message.edit_text(
-                        f"🔄 **Indexing in Progress...**\n📊 **Checked:** `{min(current, last_msg_id)}/{last_msg_id}`\n✅ **Saved Files:** `{saved}`",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Cancel", callback_data="cancel_index")]])
-                    )
-                except Exception:
-                    pass
-
-        await query.message.edit_text(f"✅ **Indexing പൂർത്തിയായി!**\n📁 **Total Files Saved:** `{saved}`")
+        bot.answer_callback_query(call.id)
 
     elif data == "status_cb":
-        total_files = await files_col.count_documents({})
-        total_users = await users_col.count_documents({})
-        await query.answer(f"🤖 {BOT_NAME}\n📁 Total Files: {total_files}\n👥 Total Users: {total_users}", show_alert=True)
+        total_files = files_col.count_documents({})
+        total_users = users_col.count_documents({})
+        bot.answer_callback_query(
+            call.id,
+            f"🤖 {BOT_NAME}\n📁 Total Files: {total_files}\n👥 Total Users: {total_users}",
+            show_alert=True
+        )
 
     elif data.startswith("checksub_"):
         file_unique_id = data.split("_", 1)[1]
-        if not await is_subscribed(client, user_id):
-            return await query.answer("❌ നിങ്ങൾ ഇതുവരെ ചാനലിൽ ജോയിൻ ചെയ്തിട്ടില്ല! ജോയിൻ ചെയ്ത ശേഷം ശ്രമിക്കുക.", show_alert=True)
+        if not is_subscribed(user_id):
+            return bot.answer_callback_query(
+                call.id,
+                "❌ നിങ്ങൾ ഇതുവരെ ചാനലിൽ ജോയിൻ ചെയ്തിട്ടില്ല! ജോയിൻ ചെയ്ത ശേഷം ശ്രമിക്കുക.",
+                show_alert=True
+            )
         
-        file_data = await files_col.find_one({"_id": file_unique_id})
+        file_data = files_col.find_one({"_id": file_unique_id})
         if not file_data:
-            return await query.answer("❌ ഫയൽ കണ്ടെത്താനായില്ല!", show_alert=True)
+            return bot.answer_callback_query(call.id, "❌ ഫയൽ കണ്ടെത്താനായില്ല!", show_alert=True)
         
-        await query.message.delete()
-        await client.send_cached_media(
-            chat_id=user_id,
-            file_id=file_data["file_id"],
-            caption=f"🎬 **{file_data['file_name']}**\n📦 **Size:** `{get_size(file_data['file_size'])}`\n\n🤖 **Powered By:** **{BOT_NAME}**\n📢 **Join:** [Movie Request Group]({GRP_LNK})"
-        )
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        send_file_to_user(user_id, file_data)
 
     elif data.startswith("page_"):
         _, page_str, search_q = data.split("_", 2)
@@ -374,38 +323,25 @@ async def cb_handler(client: Client, query: CallbackQuery):
         words = clean_query.split()
         regex_pattern = ".*".join(map(re.escape, words))
 
-        cursor = files_col.find({"search_name": {"$regex": regex_pattern, "$options": "i"}})
-        results = await cursor.to_list(length=50)
+        results = list(files_col.find({"search_name": {"$regex": regex_pattern, "$options": "i"}}).limit(50))
         if results:
-            await send_results_page(client, query, results, search_q, page=page)
-        await query.answer()
+            send_results_page(call, results, search_q, page=page, is_edit=True)
+        bot.answer_callback_query(call.id)
 
-# ----------------- WEB SERVER & STARTUP -----------------
-async def health_check(request):
-    return web.Response(text=f"{BOT_NAME} is Running Alive!")
-
-async def start_services():
-    # Start Web Server first so Render detects Port 8080 immediately
-    server = web.Application()
-    server.router.add_get("/", health_check)
-    runner = web.AppRunner(server)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+# ----------------- START BOT & WEB SERVER -----------------
+if __name__ == "__main__":
+    # Start Flask server in background thread for Render Port 8080
+    threading.Thread(target=run_web, daemon=True).start()
     print(f"🌐 Web Server started on Port {PORT}")
 
-    # Start Telegram Bot
-    await app.start()
-    app.me = await app.get_me()
-    print(f"🤖 {BOT_NAME} Started Successfully as @{app.me.username}")
+    # Remove any old webhooks and start polling
+    bot.remove_webhook()
+    me = bot.get_me()
+    print(f"🤖 {BOT_NAME} Started Successfully as @{me.username}")
     
     try:
-        await app.send_message(LOG_CHANNEL, f"🚀 **{BOT_NAME} Started Successfully!**")
+        bot.send_message(LOG_CHANNEL, f"🚀 <b>{BOT_NAME} Started Successfully!</b>")
     except Exception as e:
-        print(f"Log Channel Warning: {e}")
-    
-    # Keep the bot running and listening for messages
-    await idle()
-    await app.stop()
+        print(f"Log Channel Notice: {e}")
 
-if __name__ == "__main__":
-    asyncio.run(start_services())
+    bot.infinity_polling(skip_pending=True)
