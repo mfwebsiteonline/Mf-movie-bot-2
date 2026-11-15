@@ -23,14 +23,14 @@ DATABASE_URI = os.environ.get(
     "DATABASE_URI",
     "mongodb+srv://risham004:risham0043bot@cluster0.d1h9npz.mongodb.net/?retryWrites=true&w=majority"
 )
-DATABASE_NAME = "MF_Movie_Bot_2_DB"
+DATABASE_NAME = os.environ.get("DATABASE_NAME", "MF_Movie_Bot_2_DB")
 
 START_PIC = "https://i.ibb.co/Z6kwCvsD/83b9b287-1edf-4390-b0dd-c98179ec8374.jpg"
 GRP_LNK = "https://t.me/MFMovieandSeriesRequestGroup"
 CHNL_LNK = "https://t.me/mfmainchannel"
 PORT = int(os.environ.get("PORT", 8080))
 
-# Auto Delete Time in Seconds (300s = 5 Minutes, set 0 to disable)
+# Auto Delete Time in Seconds (300s = 5 Minutes)
 AUTO_DELETE_TIME = 300
 
 # Filter Categories
@@ -48,25 +48,39 @@ if not BOT_TOKEN:
     exit(1)
 
 BOT_START_TIME = time.time()
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+# Multi-threaded TeleBot for instant fast replies
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=8)
 BOT_USERNAME = ""
 
-# MongoDB Connection
-mongo_client = MongoClient(DATABASE_URI)
+# MongoDB Connection (Fast Timeout)
+mongo_client = MongoClient(DATABASE_URI, serverSelectionTimeoutMS=5000)
 db = mongo_client[DATABASE_NAME]
 files_col = db["files"]
 users_col = db["users"]
 groups_col = db["groups"]
 
-# In-memory session cache for fast filtering & pagination
+# Create index in background for super-fast search
+def init_db_indexes():
+    try:
+        files_col.create_index("file_name")
+        files_col.create_index("search_name")
+    except Exception:
+        pass
+
+threading.Thread(target=init_db_indexes, daemon=True).start()
+
+# In-memory caches so bot never slows down
 SEARCH_CACHE = {}
+KNOWN_USERS = set()
+KNOWN_GROUPS = set()
+CACHED_INVITE_LINK = None
 
 # Flask Web Server for Render
 web_app = Flask(__name__)
 
 @web_app.route("/")
 def home():
-    return f"{BOT_NAME} is Running Alive!"
+    return f"{BOT_NAME} is Running Fast & Alive!"
 
 def run_web():
     web_app.run(host="0.0.0.0", port=PORT)
@@ -109,27 +123,37 @@ def auto_delete_message(chat_id, message_id, delay=AUTO_DELETE_TIME):
             pass
     threading.Thread(target=_delete, daemon=True).start()
 
-def add_user(user_id, name):
-    try:
-        if not users_col.find_one({"_id": user_id}):
-            users_col.insert_one({"_id": user_id, "name": name, "joined_at": time.time()})
-            bot.send_message(
-                LOG_CHANNEL,
-                f"🆕 <b>#NewUser in {BOT_NAME}</b>\n👤 <b>Name:</b> {name}\n🆔 <b>ID:</b> <code>{user_id}</code>"
-            )
-    except Exception:
-        pass
-
-def add_group(chat_id, title):
-    try:
-        if not groups_col.find_one({"_id": chat_id}):
-            groups_col.insert_one({"_id": chat_id, "title": title, "added_at": time.time()})
-            bot.send_message(
-                LOG_CHANNEL,
-                f"👥 <b>#NewGroup in {BOT_NAME}</b>\n🏷️ <b>Title:</b> {title}\n🆔 <b>ID:</b> <code>{chat_id}</code>"
-            )
-    except Exception:
-        pass
+# Non-blocking background user/group logging
+def track_user_or_group_async(chat_type, chat_id, user_id, name, title=None):
+    def _worker():
+        try:
+            if chat_type == "private":
+                if user_id not in KNOWN_USERS:
+                    KNOWN_USERS.add(user_id)
+                    if not users_col.find_one({"_id": user_id}):
+                        users_col.insert_one({"_id": user_id, "name": name, "joined_at": time.time()})
+                        try:
+                            bot.send_message(
+                                LOG_CHANNEL,
+                                f"🆕 <b>#NewUser in {BOT_NAME}</b>\n👤 <b>Name:</b> {name}\n🆔 <b>ID:</b> <code>{user_id}</code>"
+                            )
+                        except Exception:
+                            pass
+            else:
+                if chat_id not in KNOWN_GROUPS:
+                    KNOWN_GROUPS.add(chat_id)
+                    if not groups_col.find_one({"_id": chat_id}):
+                        groups_col.insert_one({"_id": chat_id, "title": title or "Group", "added_at": time.time()})
+                        try:
+                            bot.send_message(
+                                LOG_CHANNEL,
+                                f"👥 <b>#NewGroup in {BOT_NAME}</b>\n🏷️ <b>Title:</b> {title}\n🆔 <b>ID:</b> <code>{chat_id}</code>"
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    threading.Thread(target=_worker, daemon=True).start()
 
 def is_subscribed(user_id):
     if not AUTH_CHANNEL or user_id in ADMINS:
@@ -143,13 +167,18 @@ def is_subscribed(user_id):
         return True
 
 def get_invite_link():
+    global CACHED_INVITE_LINK
+    if CACHED_INVITE_LINK:
+        return CACHED_INVITE_LINK
     try:
         chat = bot.get_chat(AUTH_CHANNEL)
         if chat.username:
-            return f"https://t.me/{chat.username}"
-        if chat.invite_link:
-            return chat.invite_link
-        return bot.export_chat_invite_link(AUTH_CHANNEL)
+            CACHED_INVITE_LINK = f"https://t.me/{chat.username}"
+        elif chat.invite_link:
+            CACHED_INVITE_LINK = chat.invite_link
+        else:
+            CACHED_INVITE_LINK = bot.export_chat_invite_link(AUTH_CHANNEL)
+        return CACHED_INVITE_LINK
     except Exception:
         return CHNL_LNK
 
@@ -159,28 +188,33 @@ def save_file_to_db(message):
         return False
     
     file_name = getattr(media, "file_name", None) or message.caption or "Movie_File"
-    clean_name = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", file_name)
-    caption_clean = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", message.caption or "")
+    clean_name = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", str(file_name))
+    caption_clean = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", str(message.caption or ""))
     
     file_doc = {
         "_id": media.file_unique_id,
         "file_id": media.file_id,
         "file_name": file_name,
         "search_name": f"{clean_name} {caption_clean}".lower().strip(),
-        "file_size": media.file_size,
-        "file_type": message.content_type
+        "file_size": getattr(media, "file_size", 0),
+        "file_type": message.content_type,
+        "caption": message.caption or file_name
     }
     try:
         files_col.update_one({"_id": media.file_unique_id}, {"$set": file_doc}, upsert=True)
         return True
     except Exception as e:
-        print(f"DB Error: {e}")
+        print(f"DB Save Error: {e}")
         return False
 
 def send_file_to_user(chat_id, file_data):
+    f_name = file_data.get("file_name", "Movie_File")
+    f_size = get_size(file_data.get("file_size", 0))
+    f_id = file_data.get("file_id") or file_data.get("_id")
+
     caption = (
-        f"🎬 <b>File Name:</b> <code>{file_data['file_name']}</code>\n"
-        f"📦 <b>File Size:</b> <code>{get_size(file_data['file_size'])}</code>\n\n"
+        f"🎬 <b>File Name:</b> <code>{f_name}</code>\n"
+        f"📦 <b>File Size:</b> <code>{f_size}</code>\n\n"
         f"🤖 <b>Uploaded By:</b> <a href='{CHNL_LNK}'>{BOT_NAME}</a>\n"
         f"📢 <b>Request Group:</b> <a href='{GRP_LNK}'>Click Here</a>"
     )
@@ -192,27 +226,117 @@ def send_file_to_user(chat_id, file_data):
     f_type = file_data.get("file_type", "document")
     try:
         if f_type == "video":
-            bot.send_video(chat_id, file_data["file_id"], caption=caption, reply_markup=markup)
+            bot.send_video(chat_id, f_id, caption=caption, reply_markup=markup)
         elif f_type == "audio":
-            bot.send_audio(chat_id, file_data["file_id"], caption=caption, reply_markup=markup)
+            bot.send_audio(chat_id, f_id, caption=caption, reply_markup=markup)
         else:
-            bot.send_document(chat_id, file_data["file_id"], caption=caption, reply_markup=markup)
+            bot.send_document(chat_id, f_id, caption=caption, reply_markup=markup)
         return True
     except Exception:
         try:
-            bot.send_document(chat_id, file_data["file_id"], caption=caption, reply_markup=markup)
+            bot.send_document(chat_id, f_id, caption=caption, reply_markup=markup)
             return True
         except Exception:
-            return False
+            try:
+                bot.send_video(chat_id, f_id, caption=caption, reply_markup=markup)
+                return True
+            except Exception:
+                return False
+
+# Smart multi-DB search: searches current DB + any existing EvaMaria/VJ collections in your MongoDB!
+def get_all_file_collections():
+    cols = [files_col]
+    try:
+        for db_name in mongo_client.list_database_names():
+            if db_name in ["admin", "local", "config"]:
+                continue
+            curr_db = mongo_client[db_name]
+            for col_name in curr_db.list_collection_names():
+                if col_name in ["users", "groups", "chats", "banned"]:
+                    continue
+                c = curr_db[col_name]
+                if c.full_name != files_col.full_name:
+                    cols.append(c)
+    except Exception:
+        pass
+    return cols
+
+def query_db_files(search_text):
+    clean_query = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", search_text).lower().strip()
+    words = [w for w in clean_query.split() if len(w) > 0]
+    if not words:
+        return []
+    
+    # Match words in any order across file_name, search_name, or caption
+    word_patterns = [r".*".join(map(re.escape, words))]
+    regex_str = word_patterns[0]
+    
+    query_filter = {
+        "$or": [
+            {"search_name": {"$regex": regex_str, "$options": "i"}},
+            {"file_name": {"$regex": regex_str, "$options": "i"}},
+            {"caption": {"$regex": regex_str, "$options": "i"}}
+        ]
+    }
+
+    results = []
+    seen_ids = set()
+
+    for col in get_all_file_collections():
+        try:
+            cursor = col.find(query_filter).limit(60)
+            for doc in cursor:
+                if "file_name" not in doc:
+                    continue
+                uid = str(doc.get("_id"))
+                if uid not in seen_ids:
+                    seen_ids.add(uid)
+                    # Normalize document for filter buttons
+                    if "search_name" not in doc:
+                        fn = str(doc.get("file_name", ""))
+                        cp = str(doc.get("caption", ""))
+                        doc["search_name"] = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", f"{fn} {cp}").lower()
+                    if "file_id" not in doc:
+                        doc["file_id"] = doc["_id"]
+                    results.append(doc)
+                if len(results) >= 60:
+                    break
+        except Exception:
+            continue
+        if len(results) >= 60:
+            break
+
+    return results
+
+def find_file_by_id(file_unique_id):
+    for col in get_all_file_collections():
+        try:
+            doc = col.find_one({"_id": file_unique_id})
+            if doc and "file_name" in doc:
+                if "file_id" not in doc:
+                    doc["file_id"] = doc["_id"]
+                return doc
+        except Exception:
+            continue
+    return None
 
 def generate_full_status_text():
-    total_files = files_col.count_documents({})
+    total_files = 0
+    total_media_size = 0
+    for col in get_all_file_collections():
+        try:
+            sample = col.find_one()
+            if sample and "file_name" in sample:
+                total_files += col.count_documents({})
+                pipeline = [{"$group": {"_id": None, "sz": {"$sum": "$file_size"}}}]
+                agg = list(col.aggregate(pipeline))
+                if agg:
+                    total_media_size += agg[0].get("sz", 0) or 0
+        except Exception:
+            pass
+
     total_users = users_col.count_documents({})
     total_groups = groups_col.count_documents({})
-    
-    pipeline = [{"$group": {"_id": None, "total_media_size": {"$sum": "$file_size"}}}]
-    agg_res = list(files_col.aggregate(pipeline))
-    total_media_size = agg_res[0]["total_media_size"] if agg_res else 0
 
     try:
         db_stats = db.command("dbstats")
@@ -229,15 +353,15 @@ def generate_full_status_text():
         f"📊 <b>{BOT_NAME} - FULL ADMIN & DB STATUS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🤖 <b>Bot System Status:</b>\n"
-        f"├ 🟢 <b>Status:</b> Online (PM & Group Filter)\n"
+        f"├ 🟢 <b>Status:</b> Fast Online (PM & Group)\n"
         f"├ ⏱️ <b>Uptime:</b> <code>{get_uptime()}</code>\n"
         f"├ 👥 <b>Total Users:</b> <code>{total_users}</code>\n"
         f"└ 💬 <b>Total Groups:</b> <code>{total_groups}</code>\n\n"
         f"📁 <b>Indexed Media Details:</b>\n"
-        f"├ 🎬 <b>Total Files:</b> <code>{total_files}</code>\n"
+        f"├ 🎬 <b>Total Files Found:</b> <code>{total_files}</code>\n"
         f"└ 📦 <b>Total Media Size:</b> <code>{get_size(total_media_size)}</code>\n\n"
         f"🗄️ <b>MongoDB Database Details:</b>\n"
-        f"├ 🏷️ <b>DB Name:</b> <code>{DATABASE_NAME}</code>\n"
+        f"├ 🏷️ <b>Active DB:</b> <code>{DATABASE_NAME}</code>\n"
         f"├ 📂 <b>Collections:</b> <code>{collections_count}</code>\n"
         f"├ 📝 <b>Data Size:</b> <code>{get_size(data_size)}</code>\n"
         f"├ 🗂️ <b>Storage Size:</b> <code>{get_size(storage_size)}</code>\n"
@@ -250,21 +374,16 @@ def generate_full_status_text():
 # ----------------- START & ADMIN COMMANDS -----------------
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        BOT_USERNAME = bot.get_me().username
-
     user_id = message.from_user.id
-    if message.chat.type == "private":
-        add_user(user_id, message.from_user.first_name)
-    else:
-        add_group(message.chat.id, message.chat.title)
+    track_user_or_group_async(
+        message.chat.type, message.chat.id, user_id,
+        message.from_user.first_name, getattr(message.chat, "title", None)
+    )
 
     args = message.text.split()
     if len(args) > 1:
         param = args[1]
         
-        # Handle Send All Files from Group/PM
         if param.startswith("all_"):
             parts = param.split("_")
             sid = parts[1]
@@ -276,7 +395,7 @@ def start_cmd(message):
                 markup.add(InlineKeyboardButton("📢 Join Our Main Channel", url=invite_url))
                 markup.add(InlineKeyboardButton("🔄 Try Again", url=f"https://t.me/{BOT_USERNAME}?start={param}"))
                 return bot.send_message(
-                    user_id,
+                    message.chat.id,
                     f"❗ <b>നിങ്ങൾ ഞങ്ങളുടെ ചാനലിൽ ജോയിൻ ചെയ്തിട്ടില്ല!</b>\n\n"
                     f"താഴെ കാണുന്ന ബട്ടൺ വഴി ചാനലിൽ ജോയിൻ ചെയ്ത ശേഷം <b>Try Again</b> ക്ലിക്ക് ചെയ്യുക.",
                     reply_markup=markup
@@ -284,17 +403,16 @@ def start_cmd(message):
 
             session = SEARCH_CACHE.get(sid)
             if not session:
-                return bot.send_message(user_id, "⌛ ഈ സെർച്ച് ലിങ്ക് കാലാവധി കഴിഞ്ഞു. വീണ്ടും മൂവി പേര് ടൈപ്പ് ചെയ്ത് സെർച്ച് ചെയ്യുക.")
+                return bot.send_message(message.chat.id, "⌛ ഈ സെർച്ച് ലിങ്ക് കാലാവധി കഴിഞ്ഞു. വീണ്ടും മൂവി പേര് ടൈപ്പ് ചെയ്ത് സെർച്ച് ചെയ്യുക.")
             
             results = session["filtered"]
             files_to_send = results[page * 10 : (page + 1) * 10]
-            bot.send_message(user_id, f"📥 <b>Sending {len(files_to_send)} files...</b>")
+            bot.send_message(message.chat.id, f"📥 <b>Sending {len(files_to_send)} files...</b>")
             for f in files_to_send:
-                send_file_to_user(user_id, f)
-                time.sleep(0.3)
+                send_file_to_user(message.chat.id, f)
+                time.sleep(0.25)
             return
 
-        # Handle Single File Request
         if param.startswith("file_"):
             file_unique_id = param.split("_", 1)[1]
             
@@ -304,17 +422,17 @@ def start_cmd(message):
                 markup.add(InlineKeyboardButton("📢 Join Our Main Channel", url=invite_url))
                 markup.add(InlineKeyboardButton("🔄 Try Again", callback_data=f"checksub_{file_unique_id}"))
                 return bot.send_message(
-                    user_id,
+                    message.chat.id,
                     f"❗ <b>നിങ്ങൾ ഞങ്ങളുടെ ചാനലിൽ ജോയിൻ ചെയ്തിട്ടില്ല!</b>\n\n"
                     f"<b>{BOT_NAME}</b>-ൽ നിന്ന് ഫയലുകൾ ലഭിക്കാൻ താഴെ കാണുന്ന ബട്ടൺ വഴി ചാനലിൽ ജോയിൻ ചെയ്ത ശേഷം <b>Try Again</b> ക്ലിക്ക് ചെയ്യുക.",
                     reply_markup=markup
                 )
             
-            file_data = files_col.find_one({"_id": file_unique_id})
+            file_data = find_file_by_id(file_unique_id)
             if not file_data:
-                return bot.send_message(user_id, "❌ ഈ ഫയൽ ഡാറ്റാബേസിൽ കണ്ടെത്താനായില്ല!")
+                return bot.send_message(message.chat.id, "❌ ഈ ഫയൽ ഡാറ്റാബേസിൽ കണ്ടെത്താനായില്ല!")
             
-            return send_file_to_user(user_id, file_data)
+            return send_file_to_user(message.chat.id, file_data)
 
     markup = InlineKeyboardMarkup()
     markup.add(InlineKeyboardButton("➕ Add Me To Your Group ➕", url=f"https://t.me/{BOT_USERNAME}?startgroup=true"))
@@ -329,20 +447,19 @@ def start_cmd(message):
     if user_id in ADMINS:
         markup.add(InlineKeyboardButton("📊 Admin Full DB Status", callback_data="full_status_cb"))
 
-    bot.send_photo(
-        message.chat.id,
-        photo=START_PIC,
-        caption=(
-            f"ഹലോ <b>{message.from_user.first_name}</b> 👋,\n\n"
-            f"ഞാൻ <b>{BOT_NAME}</b> ആണ്! 🎬\n\n"
-            f"✨ <b>എന്റെ പ്രത്യേകതകൾ:</b>\n"
-            f"• <b>Bot PM Search:</b> ഇവിടെ നേരിട്ട് മൂവി പേര് അയച്ചാൽ ഫയൽ കിട്ടും.\n"
-            f"• <b>Group Auto-Filter:</b> ഗ്രൂപ്പിൽ ആഡ് ചെയ്താൽ അവിടെയും മൂവി ബട്ടണുകൾ വരും.\n"
-            f"• <b>Smart Filters:</b> Language, Quality, Year, Season ഫിൽട്ടറുകൾ.\n\n"
-            f"👇 <b>ഇപ്പോൾ തന്നെ നിങ്ങൾക്ക് വേണ്ട സിനിമയുടെ പേര് ഇവിടെ ടൈപ്പ് ചെയ്ത് അയക്കൂ!</b>"
-        ),
-        reply_markup=markup
+    caption_text = (
+        f"ഹലോ <b>{message.from_user.first_name}</b> 👋,\n\n"
+        f"ഞാൻ <b>{BOT_NAME}</b> ആണ്! 🎬\n\n"
+        f"✨ <b>എന്റെ പ്രത്യേകതകൾ:</b>\n"
+        f"• <b>Direct PM Search:</b> ഇവിടെ നേരിട്ട് മൂവി പേര് അയച്ചാൽ ഫയൽ ബട്ടണുകൾ വരും.\n"
+        f"• <b>Group Auto-Filter:</b> ഗ്രൂപ്പിൽ മൂവി പേര് അയച്ചാലും ബട്ടണുകൾ വരും.\n"
+        f"• <b>Smart Filters:</b> Language, Quality, Year, Season ഫിൽട്ടറുകൾ.\n\n"
+        f"👇 <b>നിങ്ങൾക്ക് വേണ്ട സിനിമയുടെ പേര് ഇവിടെ ടൈപ്പ് ചെയ്ത് അയക്കൂ!</b>"
     )
+    try:
+        bot.send_photo(message.chat.id, photo=START_PIC, caption=caption_text, reply_markup=markup)
+    except Exception:
+        bot.send_message(message.chat.id, caption_text, reply_markup=markup)
 
 @bot.message_handler(commands=["status", "stats", "db"])
 def status_cmd(message):
@@ -388,39 +505,33 @@ def broadcast_cmd(message):
         message_id=sts.message_id
     )
 
-# ----------------- AUTO CHANNEL & ADMIN FILE SAVING -----------------
+# ----------------- AUTO CHANNEL, GROUP & ADMIN FILE SAVING -----------------
 @bot.channel_post_handler(content_types=["document", "video", "audio"])
 def channel_file_save(message):
-    if message.chat.id in FILE_CHANNELS:
+    # Save automatically from configured channel OR any channel where bot is admin
+    if message.chat.id in FILE_CHANNELS or message.chat.type == "channel":
         save_file_to_db(message)
 
 @bot.message_handler(content_types=["document", "video", "audio"])
-def admin_pm_file_save(message):
-    if message.chat.type == "private" and message.from_user.id in ADMINS:
+def pm_or_group_file_save(message):
+    if message.from_user and message.from_user.id in ADMINS:
         if save_file_to_db(message):
-            bot.reply_to(message, f"✅ <b>ഫയൽ {BOT_NAME} ഡാറ്റാബേസിലേക്ക് സേവ് ചെയ്തിട്ടുണ്ട്!</b>")
+            if message.chat.type == "private":
+                bot.reply_to(message, f"✅ <b>ഫയൽ {BOT_NAME} ഡാറ്റാബേസിലേക്ക് സേവ് ചെയ്തിട്ടുണ്ട്!</b>")
 
-# ----------------- SEARCH & ADVANCED FILTER ENGINE -----------------
-def query_db_files(search_text):
-    clean_query = re.sub(r"[@_\-\.\+\[\]\(\)]", " ", search_text).lower().strip()
-    words = clean_query.split()
-    if not words:
-        return []
-    regex_pattern = ".*".join(map(re.escape, words))
-    return list(files_col.find({"search_name": {"$regex": regex_pattern, "$options": "i"}}).limit(100))
-
-@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/"), content_types=["text"])
+# ----------------- FAST SEARCH & ADVANCED FILTER ENGINE -----------------
+@bot.message_handler(content_types=["text"])
 def handle_search(message):
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        BOT_USERNAME = bot.get_me().username
+    if not message.text or message.text.startswith("/"):
+        return
 
-    if message.chat.type == "private":
-        add_user(message.from_user.id, message.from_user.first_name)
-    else:
-        add_group(message.chat.id, message.chat.title)
+    track_user_or_group_async(
+        message.chat.type, message.chat.id, message.from_user.id,
+        message.from_user.first_name, getattr(message.chat, "title", None)
+    )
 
-    query = message.text.strip()
+    # Clean group bot mentions if any (e.g. "Leo @botusername")
+    query = re.sub(r"@\w+", "", message.text).strip()
     if len(query) < 2:
         return
 
@@ -435,18 +546,16 @@ def handle_search(message):
         reply_msg = bot.reply_to(
             message,
             f"😕 ഹലോ <b>{message.from_user.first_name}</b>,\n\n"
-            f"<code>{query}</code> എന്ന പേരിൽ ഫയലുകൾ ഒന്നും കണ്ടെത്തിയില്ല!\n\n"
-            f"• താഴെ കാണുന്ന ബട്ടൺ വഴി Google-ൽ ശരിയായ സ്പെല്ലിംഗ് നോക്കി വീണ്ടും അയക്കുക.\n"
-            f"• റിലീസ് ആകാത്ത സിനിമയാണെങ്കിൽ ഗ്രൂപ്പിൽ റിക്വസ്റ്റ് ചെയ്യാം.",
+            f"<code>{query}</code> എന്ന പേരിൽ ഡാറ്റാബേസിൽ ഫയലുകൾ ഒന്നും കണ്ടെത്തിയില്ല!\n\n"
+            f"💡 <i>(അഡ്മിൻ ശ്രദ്ധിക്കുക: ചാനലിൽ പുതിയ ഫയലുകൾ ഇടുകയോ ബോട്ടിലേക്ക് മൂവി ഫയൽ Forward ചെയ്യുകയോ ചെയ്താൽ ഉടൻ സേവ് ആകും).</i>",
             reply_markup=markup
         )
         if message.chat.type != "private":
-            auto_delete_message(reply_msg.chat.id, reply_msg.message_id, 60)
+            auto_delete_message(reply_msg.chat.id, reply_msg.message_id, 45)
         return
 
-    # Create Search Session for Instant Filtering
     sid = uuid.uuid4().hex[:8]
-    if len(SEARCH_CACHE) > 300:
+    if len(SEARCH_CACHE) > 500:
         SEARCH_CACHE.clear()
 
     SEARCH_CACHE[sid] = {
@@ -480,7 +589,7 @@ def render_filter_page(message_or_call, sid, page=0, is_edit=False):
 
     markup = InlineKeyboardMarkup()
 
-    # Row 1: Top Action Row (Send All Files)
+    # Row 1: Send All Files Button
     markup.add(
         InlineKeyboardButton(
             f"📤 Send All Files ({len(current_files)}) 📤",
@@ -488,7 +597,7 @@ def render_filter_page(message_or_call, sid, page=0, is_edit=False):
         )
     )
 
-    # Row 2: Filter Selection Buttons (Language, Quality, Year, Season)
+    # Row 2: Filter Selection Buttons
     markup.row(
         InlineKeyboardButton("🌐 Language", callback_data=f"menu_lang_{sid}"),
         InlineKeyboardButton("🎞️ Quality", callback_data=f"menu_qual_{sid}"),
@@ -502,11 +611,12 @@ def render_filter_page(message_or_call, sid, page=0, is_edit=False):
     else:
         markup.add(InlineKeyboardButton("📺 Seasons / Episodes", callback_data=f"menu_seas_{sid}"))
 
-    # Row 3+: Movie File Buttons (Works in both PM & Group!)
-    for file in current_files:
-        size_str = get_size(file["file_size"])
-        btn_text = f"[{size_str}] {file['file_name']}"
-        markup.add(InlineKeyboardButton(btn_text, callback_data=f"getfile_{file['_id']}"))
+    # Row 3+: Movie File Buttons
+    for idx, file in enumerate(current_files):
+        size_str = get_size(file.get("file_size", 0))
+        btn_text = f"🎬 [{size_str}] {file.get('file_name', 'Movie')}"
+        # Store file reference in session by index to avoid 64-byte callback_data limit error!
+        markup.add(InlineKeyboardButton(btn_text[:60], callback_data=f"fidx_{sid}_{start_idx + idx}"))
 
     # Bottom Row: Pagination
     nav_btns = []
@@ -522,11 +632,11 @@ def render_filter_page(message_or_call, sid, page=0, is_edit=False):
     markup.add(InlineKeyboardButton("❌ Close Menu", callback_data="close_msg"))
 
     text = (
-        f"🎬 <b>Search Query:</b> <code>{query}</code>\n"
-        f"🏷️ <b>Filter Applied:</b> <code>{filter_label}</code>\n"
-        f"📁 <b>Total Files Found:</b> <code>{len(results)}</code>\n"
-        f"⏳ <i>Auto-Delete in 5 Minutes</i>\n\n"
-        f"👇 <b>നിങ്ങൾക്ക് ആവശ്യമുള്ള ഫയൽ അല്ലെങ്കിൽ ഫിൽട്ടർ ബട്ടൺ തിരഞ്ഞെടുക്കുക:</b>"
+        f"🤖 <b>{BOT_NAME}</b>\n"
+        f"🎬 <b>Movie:</b> <code>{query}</code>\n"
+        f"🏷️ <b>Filter:</b> <code>{filter_label}</code>\n"
+        f"📁 <b>Total Found:</b> <code>{len(results)}</code>\n\n"
+        f"👇 <b>താഴെ കാണുന്ന ബട്ടണിൽ ക്ലിക്ക് ചെയ്ത് ഫയൽ ഡൗൺലോഡ് ചെയ്യാം:</b>"
     )
 
     if is_edit:
@@ -545,10 +655,6 @@ def render_filter_page(message_or_call, sid, page=0, is_edit=False):
 # ----------------- CALLBACK HANDLERS -----------------
 @bot.callback_query_handler(func=lambda call: True)
 def cb_handler(call):
-    global BOT_USERNAME
-    if not BOT_USERNAME:
-        BOT_USERNAME = bot.get_me().username
-
     data = call.data
     user_id = call.from_user.id
 
@@ -566,7 +672,7 @@ def cb_handler(call):
             f"🛠️ <b>{BOT_NAME} - Help & Features</b>\n\n"
             f"1️⃣ <b>Direct PM Search:</b> ബോട്ടിൽ നേരിട്ട് ഏത് സിനിമയുടെ പേര് അയച്ചാലും ഫയൽ ബട്ടണുകൾ വരും.\n"
             f"2️⃣ <b>Group Auto-Filter:</b> ബോട്ടുള്ള ഗ്രൂപ്പിൽ സിനിമ പേര് അയച്ചാലും ബട്ടണുകൾ വരും.\n"
-            f"3️⃣ <b>Smart Filters:</b> റിസൾട്ട് വരുമ്പോൾ <b>Language, Quality, Year, Season</b> ബട്ടണുകൾ വെച്ച് ഫിൽട്ടർ ചെയ്യാം.\n"
+            f"3️⃣ <b>How to Add Movies:</b> നിങ്ങളുടെ ഫയൽ ചാനലിൽ സിനിമകൾ അപ്‌ലോഡ് ചെയ്യുകയോ ബോട്ടിലേക്ക് നേരിട്ട് Forward ചെയ്യുകയോ ചെയ്യുക.\n"
             f"4️⃣ <b>Admin Commands:</b>\n"
             f"• <code>/status</code> or <code>/db</code> - Full Database & Bot Status\n"
             f"• <code>/broadcast</code> - Reply to a message to broadcast\n"
@@ -581,7 +687,7 @@ def cb_handler(call):
         about_txt = (
             f"ℹ️ <b>About {BOT_NAME}</b>\n\n"
             f"🤖 <b>Bot Name:</b> {BOT_NAME}\n"
-            f"⚡ <b>Engine:</b> Fast Auto-Filter v2.0\n"
+            f"⚡ <b>Engine:</b> Multi-Threaded Auto-Filter v3.0\n"
             f"🗄️ <b>Database:</b> MongoDB Cloud\n"
             f"📢 <b>Channel:</b> <a href='{CHNL_LNK}'>Main Channel</a>\n"
             f"🎬 <b>Group:</b> <a href='{GRP_LNK}'>Request Group</a>"
@@ -674,10 +780,9 @@ def cb_handler(call):
             bot.answer_callback_query(call.id, "🔄 Filter Reset!")
             return render_filter_page(call, sid, page=0, is_edit=True)
 
-        # Match language full name or short code
         matched = []
         for f in session["all_results"]:
-            sname = f["search_name"]
+            sname = f.get("search_name", "")
             if ftype == "lang":
                 full_name = next((name.lower() for name, code in LANGUAGES if code == fval), fval)
                 if fval in sname or full_name in sname:
@@ -728,7 +833,6 @@ def cb_handler(call):
         bot.answer_callback_query(call.id, f"📥 Sending {len(files_to_send)} files...")
         for f in files_to_send:
             if not send_file_to_user(user_id, f):
-                # User hasn't started bot in PM, redirect them
                 markup = InlineKeyboardMarkup()
                 markup.add(InlineKeyboardButton("📥 Click Here to Get All Files in PM", url=f"https://t.me/{BOT_USERNAME}?start=all_{sid}_{page}"))
                 return bot.send_message(
@@ -736,16 +840,23 @@ def cb_handler(call):
                     f"👋 <b>{call.from_user.first_name}</b>, ഫയലുകൾ നിങ്ങളുടെ ഇൻബോക്സിലേക്ക് ലഭിക്കാൻ താഴെ കാണുന്ന ബട്ടണിൽ ക്ലിക്ക് ചെയ്ത് ബോട്ട് <b>Start</b> ചെയ്യുക:",
                     reply_markup=markup
                 )
-            time.sleep(0.3)
+            time.sleep(0.25)
 
-    elif data.startswith("getfile_"):
-        file_unique_id = data.split("_", 1)[1]
-        
+    elif data.startswith("fidx_"):
+        _, sid, idx_str = data.split("_", 2)
+        idx = int(idx_str)
+        session = SEARCH_CACHE.get(sid)
+        if not session or idx >= len(session["filtered"]):
+            return bot.answer_callback_query(call.id, "⌛ Session Expired! വീണ്ടും സെർച്ച് ചെയ്യുക.", show_alert=True)
+
+        file_data = session["filtered"][idx]
+        file_unique_id = str(file_data.get("_id"))
+
         if not is_subscribed(user_id):
             invite_url = get_invite_link()
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("📢 Join Our Main Channel", url=invite_url))
-            markup.add(InlineKeyboardButton("🔄 Try Again", callback_data=f"checksub_{file_unique_id}"))
+            markup.add(InlineKeyboardButton("🔄 Try Again", callback_data=f"checksub_{sid}_{idx}"))
             bot.answer_callback_query(call.id, "❗ ആദ്യം ചാനലിൽ ജോയിൻ ചെയ്യുക!", show_alert=True)
             return bot.send_message(
                 call.message.chat.id,
@@ -754,11 +865,6 @@ def cb_handler(call):
                 reply_markup=markup
             )
 
-        file_data = files_col.find_one({"_id": file_unique_id})
-        if not file_data:
-            return bot.answer_callback_query(call.id, "❌ ഫയൽ കണ്ടെത്താനായില്ല!", show_alert=True)
-
-        # Send directly in PM; if clicked in group, try PM first or redirect to PM
         if call.message.chat.type == "private":
             bot.answer_callback_query(call.id, "📥 ഫയൽ അയക്കുന്നു...")
             send_file_to_user(user_id, file_data)
@@ -777,7 +883,7 @@ def cb_handler(call):
                 auto_delete_message(msg.chat.id, msg.message_id, 60)
 
     elif data.startswith("checksub_"):
-        file_unique_id = data.split("_", 1)[1]
+        parts = data.split("_")
         if not is_subscribed(user_id):
             return bot.answer_callback_query(
                 call.id,
@@ -785,7 +891,15 @@ def cb_handler(call):
                 show_alert=True
             )
         
-        file_data = files_col.find_one({"_id": file_unique_id})
+        file_data = None
+        if len(parts) == 3:
+            sid, idx_str = parts[1], parts[2]
+            session = SEARCH_CACHE.get(sid)
+            if session and int(idx_str) < len(session["filtered"]):
+                file_data = session["filtered"][int(idx_str)]
+        if not file_data:
+            file_data = find_file_by_id(parts[-1])
+
         if not file_data:
             return bot.answer_callback_query(call.id, "❌ ഫയൽ കണ്ടെത്താനായില്ല!", show_alert=True)
         
@@ -805,11 +919,6 @@ if __name__ == "__main__":
     bot.remove_webhook()
     me = bot.get_me()
     BOT_USERNAME = me.username
-    print(f"🤖 {BOT_NAME} Started Successfully as @{BOT_USERNAME}")
+    print(f"🤖 {BOT_NAME} Started Fast & Ready as @{BOT_USERNAME}")
     
-    try:
-        bot.send_message(LOG_CHANNEL, f"🚀 <b>{BOT_NAME} Started with Full Auto-Filter Features!</b>")
-    except Exception as e:
-        print(f"Log Channel Notice: {e}")
-
-    bot.infinity_polling(skip_pending=True)
+    bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
