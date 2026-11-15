@@ -3,7 +3,7 @@ import time
 import asyncio
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================= CONFIGURATION =================
@@ -11,7 +11,7 @@ API_ID = int(os.environ.get("API_ID", 39140696))
 API_HASH = os.environ.get("API_HASH", "64757b9724e7143c5cc554d7a776334b")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 
-ADMINS = [7199304293]  # നിങ്ങളുടെ മാത്രം Admin ID
+ADMINS = [7199304293]  # നിങ്ങളുടെ അഡ്മിൻ ID
 DATABASE_URI = os.environ.get(
     "DATABASE_URI",
     "mongodb+srv://risham004:risham0043bot@cluster0.d1h9npz.mongodb.net/?retryWrites=true&w=majority"
@@ -21,7 +21,7 @@ PORT = int(os.environ.get("PORT", 8080))
 # =================================================
 
 if not BOT_TOKEN:
-    print("❌ ERROR: BOT_TOKEN നൽകിയിട്ടില്ല!")
+    print("❌ ERROR: BOT_TOKEN നൽകിയിട്ടില്ല! Render Environment-ൽ BOT_TOKEN ചേർക്കുക.")
     exit(1)
 
 app = Client(
@@ -38,10 +38,10 @@ db = db_client[DATABASE_NAME]
 users_col = db["admin_data"]
 
 # Queue & State management per user
-USER_QUEUES = {}    # user_id -> list of messages
-USER_STATES = {}    # user_id -> {"current_msg": msg, "filename": str, "chat_id": id}
+USER_QUEUES = {}
+USER_STATES = {}
 
-# Flask/Aiohttp Web Server for Render Port 8080
+# Aiohttp Web Server for Render Port 8080
 async def health_check(request):
     return web.Response(text="Queue Renamer Bot is Running Alive!")
 
@@ -68,7 +68,6 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
     if round(diff % 5.0) == 0 or current == total:
         percentage = current * 100 / total
         speed = current / diff if diff > 0 else 0
-        elapsed_time = round(diff)
         time_to_completion = round((total - current) / speed) if speed > 0 else 0
         
         progress_str = "[{0}{1}] \n📁 Progress: {2}%\n".format(
@@ -95,7 +94,6 @@ def human_readable_size(size, decimal_places=2):
 
 # ----------------- QUEUE PROCESSOR -----------------
 async def process_next_in_queue(client: Client, user_id: int, chat_id: int):
-    # If already waiting for filename selection, do nothing
     if user_id in USER_STATES and USER_STATES[user_id].get("step") == "waiting_type":
         return
 
@@ -105,7 +103,6 @@ async def process_next_in_queue(client: Client, user_id: int, chat_id: int):
         await client.send_message(chat_id, "🎉 **ക്യൂവിലുള്ള എല്ലാ ഫയലുകളും വിജയകരമായി പ്രോസസ്സ് ചെയ്ത് കഴിഞ്ഞു!**")
         return
 
-    # Take the next file from queue
     next_msg = queue.pop(0)
     orig_name = getattr(next_msg.document or next_msg.video, "file_name", "Unknown_File")
     
@@ -118,7 +115,7 @@ async def process_next_in_queue(client: Client, user_id: int, chat_id: int):
 
     await client.send_message(
         chat_id,
-        f"📁 **ቀടുത്ത ഫയൽ ലഭിച്ചു:** `{orig_name}`\n"
+        f"📁 **ലഭിച്ച ഫയൽ:** `{orig_name}`\n"
         f"🔢 **ക്യൂവിൽ ബാക്കിയുള്ളത്:** `{len(queue)}` ഫയലുകൾ\n\n"
         f"📝 **ഈ ഫയലിനുള്ള പുതിയ പേര് (Extension ഉൾപ്പെടെ - ഉദാ: `Movie.mkv`) അയച്ചുതരുക:**"
     )
@@ -134,8 +131,8 @@ async def start_cmd(client: Client, message: Message):
         "ഞാൻ നിങ്ങളുടെ **Queue Batch Renamer & Rethumbnail Bot** ആണ് 🛠️\n\n"
         "📌 **ഉപയോഗിക്കുന്ന വിധം:**\n"
         "1️⃣ ഫോട്ടോ അയച്ചാൽ തമ്പ്നെയിൽ സേവ് ആകും.\n"
-        "2️⃣ എത്ര ഫയലുകൾ വേണമെങ്കിലും ഒന്നിച്ച് (Bulk/Forward) അയക്കുക.\n"
-        "3️⃣ ഓരോ ഫയലിനും പേര് നൽകി Document ആണോ Video ആണോ എന്ന് സെレクト ചെയ്യുക!\n\n"
+        "2️⃣ എത്ര ഫയലുകൾ വേണമെങ്കിലും ഒന്നിച്ച് ഫോർവേഡ് ചെയ്യുക.\n"
+        "3️⃣ ഓരോ ഫയലിനും പേര് നൽകി Document ആണോ Video ആണോ എന്ന് തിരഞ്ഞെടുക്കുക!\n\n"
         "🗑️ തമ്പ്നെയിൽ മാറ്റാൻ `/delthumb` അടിക്കുക."
     )
 
@@ -154,7 +151,6 @@ async def save_thumbnail(client: Client, message: Message):
     await users_col.update_one({"_id": message.from_user.id}, {"$set": {"thumb": thumb_id}}, upsert=True)
     await message.reply_text("✅ **കസ്റ്റം തമ്പ്നെയിൽ വിജയകരമായി സേവ് ചെയ്തു!**")
 
-# Handle Incoming Files (Single or Bulk Forward up to 100+)
 @app.on_message((filters.document | filters.video) & filters.private)
 async def receive_files(client: Client, message: Message):
     user_id = message.from_user.id
@@ -167,13 +163,11 @@ async def receive_files(client: Client, message: Message):
     USER_QUEUES[user_id].append(message)
     queue_len = len(USER_QUEUES[user_id])
 
-    # If no active processing is happening, start immediately
     if user_id not in USER_STATES:
         await process_next_in_queue(client, user_id, message.chat.id)
     else:
         await message.reply_text(f"📌 ഫയൽ ക്യൂവിലേക്ക് ചേർത്തു! (Position: {queue_len})", quote=True)
 
-# Handle Filename Text Input
 @app.on_message(filters.text & filters.private & ~filters.command(["start", "delthumb"]))
 async def handle_text_input(client: Client, message: Message):
     user_id = message.from_user.id
@@ -191,7 +185,6 @@ async def handle_text_input(client: Client, message: Message):
     state["filename"] = new_filename
     state["step"] = "waiting_type"
 
-    # Ask whether to send as Document or Video
     markup = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📄 Send as Document", callback_data="type_document"),
@@ -204,7 +197,6 @@ async def handle_text_input(client: Client, message: Message):
         reply_markup=markup
     )
 
-# Handle Document / Video Button Click & Process
 @app.on_callback_query(filters.regex("^type_"))
 async def process_file_type(client, callback):
     user_id = callback.from_user.id
@@ -215,7 +207,7 @@ async def process_file_type(client, callback):
     if not state or state.get("step") != "waiting_type":
         return await callback.answer("⌛ സെഷൻ എക്സ്പയർ ആയിരിക്കുന്നു!", show_alert=True)
 
-    send_type = callback.data.split("_")[1] # 'document' or 'video'
+    send_type = callback.data.split("_")[1]
     orig_msg = state["current_msg"]
     new_filename = state["filename"]
     chat_id = state["chat_id"]
@@ -228,7 +220,6 @@ async def process_file_type(client, callback):
     os.makedirs(downloads_dir, exist_ok=True)
 
     try:
-        # 1. Download File
         file_path = await client.download_media(
             orig_msg,
             file_name=os.path.join(downloads_dir, new_filename),
@@ -238,7 +229,6 @@ async def process_file_type(client, callback):
 
         await status_msg.edit_text("📥 **ഡൗൺലോഡ് പൂർത്തിയായി! തമ്പ്നെയിൽ സെറ്റ് ചെയ്യുന്നു...**")
 
-        # 2. Get Custom Thumbnail
         user_data = await users_col.find_one({"_id": user_id})
         thumb_path = None
         if user_data and "thumb" in user_data:
@@ -247,7 +237,6 @@ async def process_file_type(client, callback):
         await status_msg.edit_text("📤 **Telegram-ലേക്ക് അപ്‌ലോഡ് ചെയ്യുന്നു...**")
         up_start_time = time.time()
 
-        # 3. Upload File based on button choice
         if send_type == "video":
             await client.send_video(
                 chat_id=chat_id,
@@ -273,7 +262,6 @@ async def process_file_type(client, callback):
         await status_msg.edit_text(f"❌ **എറർ സംഭവിച്ചു:**\n`{e}`")
     
     finally:
-        # Cleanup local storage
         try:
             if 'file_path' in locals() and os.path.exists(file_path):
                 os.remove(file_path)
@@ -282,7 +270,6 @@ async def process_file_type(client, callback):
         except Exception:
             pass
 
-    # 4. Automatically trigger next file in queue!
     USER_STATES.pop(user_id, None)
     await process_next_in_queue(client, user_id, chat_id)
 
@@ -291,8 +278,9 @@ async def main():
     await start_web_server()
     await app.start()
     me = await app.get_me()
-    print(f"🤖 Queue Renamer Bot Started as @{me.username}")
-    await asyncio.Event().wait()
+    print(f"🤖 Queue Renamer Bot Started Successfully as @{me.username}")
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
