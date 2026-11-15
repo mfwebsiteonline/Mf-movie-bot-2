@@ -4,22 +4,27 @@ import math
 import asyncio
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from pyrogram.errors import UserNotParticipant, FloodWait
 
 # ================= CONFIGURATION =================
 BOT_NAME = "MF MOVIE BOT 2"
-API_ID = 39140696
-API_HASH = "64757b9724e7143c5cc554d7a776334b"
-BOT_TOKEN = "9132996644:AAGG5YznyacFrvjUXYW14xA8xdKBIW80Wp4"
+API_ID = int(os.environ.get("API_ID", 39140696))
+API_HASH = os.environ.get("API_HASH", "64757b9724e7143c5cc554d7a776334b")
+
+# Render Environment Variable-ൽ നിന്ന് BOT_TOKEN എടുക്കുന്നു
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 ADMINS = [7199304293]
 LOG_CHANNEL = -1004461624670
 FILE_CHANNELS = [-1004345329387]
 AUTH_CHANNEL = -1004352245988
 
-DATABASE_URI = "mongodb+srv://risham004:risham0043bot@cluster0.d1h9npz.mongodb.net/?retryWrites=true&w=majority"
+DATABASE_URI = os.environ.get(
+    "DATABASE_URI",
+    "mongodb+srv://risham004:risham0043bot@cluster0.d1h9npz.mongodb.net/?retryWrites=true&w=majority"
+)
 DATABASE_NAME = "MF_Movie_Bot_2_DB"
 
 START_PIC = "https://i.ibb.co/Z6kwCvsD/83b9b287-1edf-4390-b0dd-c98179ec8374.jpg"
@@ -28,7 +33,17 @@ CHNL_LNK = "https://t.me/mfmainchannel"
 PORT = int(os.environ.get("PORT", 8080))
 # =================================================
 
-app = Client("MF_MOVIE_BOT_2", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+if not BOT_TOKEN:
+    print("❌ ERROR: BOT_TOKEN കാണുന്നില്ല! Render Environment Variables-ൽ BOT_TOKEN ചേർക്കുക.")
+    exit(1)
+
+app = Client(
+    "MF_MOVIE_BOT_2",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True
+)
 
 # MongoDB Connection
 db_client = AsyncIOMotorClient(DATABASE_URI)
@@ -49,15 +64,15 @@ def get_size(size):
     return f"{size:.2f} {units[i]}"
 
 async def add_user(user_id, name):
-    if not await users_col.find_one({"_id": user_id}):
-        await users_col.insert_one({"_id": user_id, "name": name})
-        try:
+    try:
+        if not await users_col.find_one({"_id": user_id}):
+            await users_col.insert_one({"_id": user_id, "name": name})
             await app.send_message(
                 LOG_CHANNEL,
                 f"🆕 **#NewUser in {BOT_NAME}**\n👤 **Name:** {name}\n🆔 **ID:** `{user_id}`"
             )
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 async def is_subscribed(client: Client, user_id: int):
     if not AUTH_CHANNEL or user_id in ADMINS:
@@ -195,7 +210,6 @@ async def save_file_to_db(message: Message):
 async def auto_save_file(client: Client, message: Message):
     await save_file_to_db(message)
 
-# Forward a channel message to Admin PM to bulk index old files or save single file
 @app.on_message(filters.private & filters.user(ADMINS) & (filters.forwarded | filters.document | filters.video | filters.audio))
 async def admin_index_handler(client: Client, message: Message):
     if message.forward_from_chat and message.forward_from_chat.type == enums.ChatType.CHANNEL:
@@ -366,11 +380,12 @@ async def cb_handler(client: Client, query: CallbackQuery):
             await send_results_page(client, query, results, search_q, page=page)
         await query.answer()
 
-# ----------------- WEB SERVER FOR RENDER/KOYEB -----------------
+# ----------------- WEB SERVER & STARTUP -----------------
 async def health_check(request):
     return web.Response(text=f"{BOT_NAME} is Running Alive!")
 
 async def start_services():
+    # Start Web Server first so Render detects Port 8080 immediately
     server = web.Application()
     server.router.add_get("/", health_check)
     runner = web.AppRunner(server)
@@ -378,16 +393,19 @@ async def start_services():
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     print(f"🌐 Web Server started on Port {PORT}")
 
+    # Start Telegram Bot
     await app.start()
     app.me = await app.get_me()
-    print(f"🤖 {BOT_NAME} Started as @{app.me.username}")
+    print(f"🤖 {BOT_NAME} Started Successfully as @{app.me.username}")
+    
     try:
         await app.send_message(LOG_CHANNEL, f"🚀 **{BOT_NAME} Started Successfully!**")
     except Exception as e:
         print(f"Log Channel Warning: {e}")
     
-    await asyncio.Event().wait()
+    # Keep the bot running and listening for messages
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_services())
+    asyncio.run(start_services())
