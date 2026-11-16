@@ -1,6 +1,5 @@
-pyrofork==2.3.45
-tgcrypto
+pyTelegramBotAPI
 pymongo[srv]
-motor
-aiohttp
 dnspython
+flask
+gunicorn
